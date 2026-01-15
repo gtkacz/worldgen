@@ -28,6 +28,18 @@ cargo run --release -- generate --resolution 512 --format png --output ./output 
 This writes 6 files:
 - `planet_posx.png`, `planet_negx.png`, `planet_posy.png`, `planet_negy.png`, `planet_posz.png`, `planet_negz.png`
 
+### Assembled equirectangular maps (PNG)
+
+Export additional assembled equirectangular (lat/lon) PNGs:
+
+```bash
+cargo run --release -- generate --resolution 512 --format png --output ./output --name planet --equirect
+```
+
+Writes:
+- `planet_equirect_height.png` (16-bit grayscale)
+- `planet_equirect_biomes.png` (RGB, only if biome data exists)
+
 ### OpenEXR multi-channel export
 
 ```bash
@@ -97,3 +109,14 @@ There is a demo importer script at:
 Workflow:
 1) Generate PNG outputs (e.g. `--biome-map` for biome preview, or `--plate-map`, or `--boundary-map`).\n+2) In Blender → Scripting workspace → open `tools/blender_import_worldgen.py`.\n+3) Edit `OUTPUT_DIR`, `BASE_NAME`, and `MAP_KIND` at the top of the script.\n+4) Run Script.\n+
 The script cube-map-samples the 6 face images onto an Ico Sphere material for quick visualization.
+
+## Interactive viewer (windowed)
+
+Build/run the viewer binary. It loads the 6 face PNGs and renders an interactive assembled equirect view.
+
+```bash
+cargo run --release --bin worldgen_viewer -- --input ./output --name planet
+```
+
+If you also exported biome preview faces (`--biome-map`), the viewer will auto-detect them at `{name}_biomes_*.png`.
+Use `1` for height and `2` for biomes. Drag to pan; mouse wheel zooms.

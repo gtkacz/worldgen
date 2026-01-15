@@ -17,6 +17,8 @@ use worldgen::export::{
     export_planet_biome_map_png, BiomeMapOptions,
     export_planet_exr, ExrExportOptions, ExrChannelsPreset,
     export_planet_normal_maps_png, NormalMapOptions,
+    export_planet_equirect_height_png, export_planet_equirect_biomes_png,
+    EquirectExportOptions,
 };
 use worldgen::pipeline::{Pipeline, StageConfig, HeightmapStage, TectonicStage, ErosionStage, ClimateStage, BiomeStage};
 use worldgen::tectonics::TectonicConfig;
@@ -212,6 +214,18 @@ enum Commands {
         /// For `--format exr`: which set of channels to write.
         #[arg(long, default_value = "all-available", value_enum)]
         exr_channels: ExrChannelsCli,
+
+        /// Export assembled equirectangular PNGs (height + biomes when available).
+        #[arg(long)]
+        equirect: bool,
+
+        /// Equirectangular output width. Default: `4*resolution`.
+        #[arg(long)]
+        equirect_width: Option<u32>,
+
+        /// Equirectangular output height. Default: `2*resolution`.
+        #[arg(long)]
+        equirect_height: Option<u32>,
     },
 
     /// Display information about a planet configuration.
@@ -302,6 +316,9 @@ fn main() {
             albedo_map,
             veg_map,
             exr_channels,
+            equirect,
+            equirect_width,
+            equirect_height,
         } => {
             run_generate(
                 resolution,
@@ -347,6 +364,9 @@ fn main() {
                 albedo_map,
                 veg_map,
                 exr_channels,
+                equirect,
+                equirect_width,
+                equirect_height,
             );
         }
         Commands::Info { resolution } => {
@@ -399,6 +419,9 @@ fn run_generate(
     albedo_map: bool,
     veg_map: bool,
     exr_channels: ExrChannelsCli,
+    equirect: bool,
+    equirect_width: Option<u32>,
+    equirect_height: Option<u32>,
 ) {
     // Validate parameters
     if resolution < 16 || resolution > 8192 {
@@ -1039,6 +1062,37 @@ fn run_generate(
 
     let export_time = export_start.elapsed();
     let total_time = start.elapsed();
+
+    // Export assembled equirectangular PNGs if requested.
+    if equirect {
+        let t0 = Instant::now();
+        let opts = EquirectExportOptions {
+            width: equirect_width,
+            height: equirect_height,
+            ..Default::default()
+        };
+
+        export_planet_equirect_height_png(&planet, &output, &name, min_h, max_h, &opts)
+            .unwrap_or_else(|e| {
+                eprintln!("Error exporting equirect height PNG: {}", e);
+                std::process::exit(1);
+            });
+        println!("  Exported equirect height: {}_equirect_height.png", name);
+
+        // Biomes are only available if biomes stage ran and populated IDs.
+        match export_planet_equirect_biomes_png(&planet, &output, &name, [15, 40, 90], &opts) {
+            Ok(()) => {
+                println!("  Exported equirect biomes: {}_equirect_biomes.png", name);
+            }
+            Err(e) => {
+                println!("  Skipped equirect biomes: {}", e);
+            }
+        }
+
+        if timings {
+            println!("  Equirect export time: {:.2?}", t0.elapsed());
+        }
+    }
 
     println!("Export completed in {:.2?}", export_time);
     println!("\nTotal time: {:.2?}", total_time);

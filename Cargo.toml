@@ -19,6 +19,7 @@ rand = "0.9"
 rand_chacha = "0.9"
 wgpu = "24"
 pollster = "0.4"
+winit = "0.30.12"
 
 [dev-dependencies]
 approx = "0.5"

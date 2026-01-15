@@ -9,6 +9,7 @@ mod plate_map;
 mod biome_map;
 mod exr;
 mod normal_map;
+mod equirect;
 
 pub use png::{
     export_face_png,
@@ -35,4 +36,11 @@ pub use exr::{
 pub use normal_map::{
     export_face_normal_map_png, export_planet_normal_maps_png,
     NormalMapOptions, NormalMapError,
+};
+
+pub use equirect::{
+    export_planet_equirect_height_png,
+    export_planet_equirect_biomes_png,
+    EquirectExportOptions,
+    EquirectExportError,
 };
