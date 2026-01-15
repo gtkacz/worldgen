@@ -586,19 +586,19 @@ impl ErosionGpu {
         let total = (resolution as usize) * (resolution as usize) * 6;
 
         // Textures (ping-pong): 0=input, 1=output
-        let mut height = [
+        let height = [
             create_field(&self.ctx, "height-a", resolution, wgpu::TextureFormat::R32Float),
             create_field(&self.ctx, "height-b", resolution, wgpu::TextureFormat::R32Float),
         ];
-        let mut water = [
+        let water = [
             create_field(&self.ctx, "water-a", resolution, wgpu::TextureFormat::R32Float),
             create_field(&self.ctx, "water-b", resolution, wgpu::TextureFormat::R32Float),
         ];
-        let mut sediment = [
+        let sediment = [
             create_field(&self.ctx, "sediment-a", resolution, wgpu::TextureFormat::R32Float),
             create_field(&self.ctx, "sediment-b", resolution, wgpu::TextureFormat::R32Float),
         ];
-        let mut flux = [
+        let flux = [
             create_field(&self.ctx, "flux-a", resolution, wgpu::TextureFormat::Rgba32Float),
             create_field(&self.ctx, "flux-b", resolution, wgpu::TextureFormat::Rgba32Float),
         ];
