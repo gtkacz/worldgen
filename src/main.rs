@@ -14,11 +14,13 @@ use worldgen::export::{
     export_planet_plate_map, export_planet_boundary_map,
     PngExportOptions, RawFormat, PlateMapOptions,
     export_face_scalar_png_f32, export_face_mask_png_u8,
+    export_planet_biome_map_png, BiomeMapOptions,
 };
-use worldgen::pipeline::{Pipeline, StageConfig, HeightmapStage, TectonicStage, ErosionStage, ClimateStage};
+use worldgen::pipeline::{Pipeline, StageConfig, HeightmapStage, TectonicStage, ErosionStage, ClimateStage, BiomeStage};
 use worldgen::tectonics::TectonicConfig;
 use worldgen::erosion::{ErosionConfig, OutletModel};
 use worldgen::climate::{ClimateConfig, compute_coast_distance_km, precompute_lat_lon, compute_month};
+use worldgen::biomes::BiomeConfig;
 
 /// Procedural Earth-like planet generator.
 #[derive(Parser)]
@@ -167,6 +169,31 @@ enum Commands {
         /// Export 12 monthly climate maps (temperature + precipitation), streamed to disk.
         #[arg(long)]
         export_climate_monthly: bool,
+
+        // Biome options (Phase 5)
+        /// Skip biome generation (Phase 5).
+        #[arg(long)]
+        skip_biomes: bool,
+
+        /// Export biome preview RGB maps.
+        #[arg(long)]
+        biome_map: bool,
+
+        /// Export land mask (0/255).
+        #[arg(long)]
+        land_mask: bool,
+
+        /// Export roughness map (0..1).
+        #[arg(long)]
+        roughness_map: bool,
+
+        /// Export albedo suggestion map (0..1).
+        #[arg(long)]
+        albedo_map: bool,
+
+        /// Export vegetation density map (0..1).
+        #[arg(long)]
+        veg_map: bool,
     },
 
     /// Display information about a planet configuration.
@@ -225,6 +252,12 @@ fn main() {
             axial_tilt_deg,
             climate_iters,
             export_climate_monthly,
+            skip_biomes,
+            biome_map,
+            land_mask,
+            roughness_map,
+            albedo_map,
+            veg_map,
         } => {
             run_generate(
                 resolution,
@@ -260,6 +293,12 @@ fn main() {
                 axial_tilt_deg,
                 climate_iters,
                 export_climate_monthly,
+                skip_biomes,
+                biome_map,
+                land_mask,
+                roughness_map,
+                albedo_map,
+                veg_map,
             );
         }
         Commands::Info { resolution } => {
@@ -302,6 +341,12 @@ fn run_generate(
     axial_tilt_deg: f32,
     climate_iters: u32,
     export_climate_monthly: bool,
+    skip_biomes: bool,
+    biome_map: bool,
+    land_mask: bool,
+    roughness_map: bool,
+    albedo_map: bool,
+    veg_map: bool,
 ) {
     // Validate parameters
     if resolution < 16 || resolution > 8192 {
@@ -412,6 +457,19 @@ fn run_generate(
         );
     } else {
         println!("Climate simulation: SKIPPED");
+    }
+
+    // Add biomes stage (Phase 5) unless skipped.
+    if !skip_biomes {
+        let biome_cfg = BiomeConfig {
+            sea_level,
+            seed,
+            ..Default::default()
+        };
+        pipeline.add_stage(BiomeStage::new(biome_cfg));
+        println!("Biome generation enabled");
+    } else {
+        println!("Biome generation: SKIPPED");
     }
 
     pipeline
@@ -748,6 +806,111 @@ fn run_generate(
             }
 
             println!("  Exported climate month {:02}: temp + precip", (month_idx + 1));
+        }
+    }
+
+    // Export biome maps if requested.
+    if !skip_biomes && (biome_map || land_mask || roughness_map || albedo_map || veg_map) {
+        let res = planet.resolution();
+
+        if biome_map {
+            let biome_name = format!("{}_biomes", name);
+            export_planet_biome_map_png(&planet, &output, &biome_name, &BiomeMapOptions::default())
+                .unwrap_or_else(|e| {
+                    eprintln!("Error exporting biome map: {}", e);
+                    std::process::exit(1);
+                });
+            println!("  Exported biome preview maps: {}_*.png", biome_name);
+        }
+
+        if land_mask {
+            for face in &planet.faces {
+                if let Some(m) = &face.land_mask {
+                    let filename = format!("{}_land_{}.png", name, face.id.short_name());
+                    let path = output.join(filename);
+                    export_face_mask_png_u8(
+                        res,
+                        m,
+                        &path,
+                        image::codecs::png::CompressionType::Default,
+                        image::codecs::png::FilterType::Adaptive,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error exporting land mask: {}", e);
+                        std::process::exit(1);
+                    });
+                }
+            }
+            println!("  Exported land masks: {}_land_*.png", name);
+        }
+
+        if roughness_map {
+            for face in &planet.faces {
+                if let Some(r) = &face.roughness {
+                    let filename = format!("{}_roughness_{}.png", name, face.id.short_name());
+                    let path = output.join(filename);
+                    export_face_scalar_png_f32(
+                        res,
+                        r,
+                        &path,
+                        0.0,
+                        1.0,
+                        image::codecs::png::CompressionType::Default,
+                        image::codecs::png::FilterType::Adaptive,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error exporting roughness map: {}", e);
+                        std::process::exit(1);
+                    });
+                }
+            }
+            println!("  Exported roughness maps: {}_roughness_*.png", name);
+        }
+
+        if albedo_map {
+            for face in &planet.faces {
+                if let Some(a) = &face.albedo {
+                    let filename = format!("{}_albedo_{}.png", name, face.id.short_name());
+                    let path = output.join(filename);
+                    export_face_scalar_png_f32(
+                        res,
+                        a,
+                        &path,
+                        0.0,
+                        1.0,
+                        image::codecs::png::CompressionType::Default,
+                        image::codecs::png::FilterType::Adaptive,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error exporting albedo map: {}", e);
+                        std::process::exit(1);
+                    });
+                }
+            }
+            println!("  Exported albedo maps: {}_albedo_*.png", name);
+        }
+
+        if veg_map {
+            for face in &planet.faces {
+                if let Some(v) = &face.vegetation_density {
+                    let filename = format!("{}_veg_{}.png", name, face.id.short_name());
+                    let path = output.join(filename);
+                    export_face_scalar_png_f32(
+                        res,
+                        v,
+                        &path,
+                        0.0,
+                        1.0,
+                        image::codecs::png::CompressionType::Default,
+                        image::codecs::png::FilterType::Adaptive,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error exporting vegetation map: {}", e);
+                        std::process::exit(1);
+                        });
+                }
+            }
+            println!("  Exported vegetation maps: {}_veg_*.png", name);
         }
     }
 

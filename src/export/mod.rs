@@ -6,6 +6,7 @@
 mod png;
 mod raw;
 mod plate_map;
+mod biome_map;
 
 pub use png::{
     export_face_png,
@@ -20,4 +21,8 @@ pub use plate_map::{
     export_face_boundary_map, export_planet_boundary_map,
     generate_plate_colors, generate_plate_colors_by_type,
     PlateMapOptions, PlateMapError,
+};
+pub use biome_map::{
+    export_face_biome_map_png, export_planet_biome_map_png,
+    BiomeMapOptions, BiomeMapError,
 };

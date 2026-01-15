@@ -142,6 +142,23 @@ pub struct CubeFace {
     /// Maximum monthly temperature across the year (°C) (populated after climate stage).
     #[serde(skip)]
     pub temp_max_month_c: Option<Vec<f32>>,
+
+    // --- Biomes (Phase 5) ---
+    /// Land mask (0/255). Oceans are 0. (populated after biome stage).
+    #[serde(skip)]
+    pub land_mask: Option<Vec<u8>>,
+    /// Biome IDs (u8). 0 is reserved for non-land/ocean. (populated after biome stage).
+    #[serde(skip)]
+    pub biome_ids: Option<Vec<u8>>,
+    /// Roughness/ruggedness proxy in [0,1]. (populated after biome stage).
+    #[serde(skip)]
+    pub roughness: Option<Vec<f32>>,
+    /// Albedo suggestion in [0,1]. (populated after biome stage).
+    #[serde(skip)]
+    pub albedo: Option<Vec<f32>>,
+    /// Vegetation density in [0,1]. (populated after biome stage).
+    #[serde(skip)]
+    pub vegetation_density: Option<Vec<f32>>,
 }
 
 impl CubeFace {
@@ -166,6 +183,12 @@ impl CubeFace {
             precip_annual_mm: None,
             temp_min_month_c: None,
             temp_max_month_c: None,
+
+            land_mask: None,
+            biome_ids: None,
+            roughness: None,
+            albedo: None,
+            vegetation_density: None,
         }
     }
 

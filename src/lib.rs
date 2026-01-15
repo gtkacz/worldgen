@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod tectonics;
 pub mod erosion;
 pub mod climate;
+pub mod biomes;
 
 pub use geometry::{CubeFaceId, FaceCoord};
 pub use noise::FractalNoiseConfig;
@@ -19,3 +20,5 @@ pub use pipeline::{GenerationStage, HeightmapStage, TectonicStage, ErosionStage,
 pub use tectonics::{TectonicConfig, TectonicPlate, CrustType, SphericalVoronoi};
 pub use erosion::{ErosionConfig, OutletModel};
 pub use climate::ClimateConfig;
+pub use biomes::BiomeConfig;
+pub use biomes::biome_preview_rgb;

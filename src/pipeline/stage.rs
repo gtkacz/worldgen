@@ -14,6 +14,7 @@ use crate::erosion::cpu::rivers::{rivers_from_heights, write_river_outputs_to_pl
 use crate::erosion::wgpu::ErosionGpuContext;
 use crate::erosion::wgpu::ErosionGpu;
 use crate::climate::{ClimateConfig, compute_coast_distance_km, precompute_lat_lon, compute_month};
+use crate::biomes::{BiomeConfig, compute_biomes};
 use crate::tectonics::{
     TectonicConfig, TectonicPlate, SphericalVoronoi, PlateBoundary,
     detect_boundaries,
@@ -676,10 +677,131 @@ impl GenerationStage for ClimateStage {
     }
 }
 
+/// Biome generation stage (Phase 5): biome IDs + derived maps.
+pub struct BiomeStage {
+    pub config: BiomeConfig,
+}
+
+impl BiomeStage {
+    pub fn new(config: BiomeConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl GenerationStage for BiomeStage {
+    fn id(&self) -> StageId {
+        StageId::Biomes
+    }
+
+    fn name(&self) -> &str {
+        "Biome Generation"
+    }
+
+    fn dependencies(&self) -> &[StageId] {
+        &[StageId::Climate]
+    }
+
+    fn execute(&self, planet: &mut Planet, _config: &StageConfig) -> Result<(), PipelineError> {
+        let res = planet.resolution();
+        let per_face = (res * res) as usize;
+        let total = per_face * 6;
+
+        // Validate required climate fields exist.
+        for face in &planet.faces {
+            if face.temperature_mean_c.is_none()
+                || face.precip_annual_mm.is_none()
+                || face.temp_min_month_c.is_none()
+                || face.temp_max_month_c.is_none()
+            {
+                return Err(PipelineError::StageFailed(
+                    self.name().to_string(),
+                    "Missing climate data on CubeFace (run Climate stage first)".to_string(),
+                ));
+            }
+        }
+
+        // Flatten inputs (heights + climate).
+        let heights: Vec<f32> = {
+            let mut out = vec![0.0f32; total];
+            for (i, face) in planet.faces.iter().enumerate() {
+                out[i * per_face..(i + 1) * per_face].copy_from_slice(&face.heights);
+            }
+            out
+        };
+
+        let temp_mean: Vec<f32> = {
+            let mut out = vec![0.0f32; total];
+            for (i, face) in planet.faces.iter().enumerate() {
+                out[i * per_face..(i + 1) * per_face]
+                    .copy_from_slice(face.temperature_mean_c.as_ref().unwrap());
+            }
+            out
+        };
+
+        let precip_annual: Vec<f32> = {
+            let mut out = vec![0.0f32; total];
+            for (i, face) in planet.faces.iter().enumerate() {
+                out[i * per_face..(i + 1) * per_face]
+                    .copy_from_slice(face.precip_annual_mm.as_ref().unwrap());
+            }
+            out
+        };
+
+        let temp_min_month: Vec<f32> = {
+            let mut out = vec![0.0f32; total];
+            for (i, face) in planet.faces.iter().enumerate() {
+                out[i * per_face..(i + 1) * per_face]
+                    .copy_from_slice(face.temp_min_month_c.as_ref().unwrap());
+            }
+            out
+        };
+
+        // Optional river mask (may be absent if erosion is skipped).
+        let river_mask_flat: Option<Vec<u8>> = {
+            let any = planet.faces.iter().any(|f| f.river_mask.is_some());
+            if !any {
+                None
+            } else {
+                let mut out = vec![0u8; total];
+                for (i, face) in planet.faces.iter().enumerate() {
+                    if let Some(m) = &face.river_mask {
+                        out[i * per_face..(i + 1) * per_face].copy_from_slice(m);
+                    }
+                }
+                Some(out)
+            }
+        };
+
+        let outputs = compute_biomes(
+            res,
+            &self.config,
+            &heights,
+            &temp_mean,
+            &precip_annual,
+            &temp_min_month,
+            river_mask_flat.as_deref(),
+        );
+
+        // Write outputs back to faces.
+        for (fi, face) in planet.faces.iter_mut().enumerate() {
+            let a = fi * per_face;
+            let b = (fi + 1) * per_face;
+            face.land_mask = Some(outputs.land_mask[a..b].to_vec());
+            face.biome_ids = Some(outputs.biome_ids[a..b].to_vec());
+            face.roughness = Some(outputs.roughness[a..b].to_vec());
+            face.albedo = Some(outputs.albedo[a..b].to_vec());
+            face.vegetation_density = Some(outputs.vegetation_density[a..b].to_vec());
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::erosion::ErosionBackend;
+    use crate::biomes::BiomeConfig;
 
     #[test]
     fn test_stage_config() {
@@ -765,5 +887,35 @@ mod tests {
     fn test_stage_id_name() {
         assert_eq!(StageId::Heightmap.name(), "heightmap");
         assert_eq!(StageId::Tectonics.name(), "tectonics");
+    }
+
+    #[test]
+    fn test_pipeline_climate_then_biomes_populates_outputs() {
+        let config = StageConfig::default();
+        let mut pipeline = Pipeline::new(config);
+        pipeline.add_stage(HeightmapStage);
+        pipeline.add_stage(ClimateStage::new(ClimateConfig::earth_like()));
+        pipeline.add_stage(BiomeStage::new(BiomeConfig { sea_level: 0.0, seed: 42, ..Default::default() }));
+
+        let mut planet = Planet::new(32, 42, 6371.0);
+        pipeline.run(&mut planet).unwrap();
+
+        for face in &planet.faces {
+            assert!(face.land_mask.is_some(), "land_mask should be populated");
+            assert!(face.biome_ids.is_some(), "biome_ids should be populated");
+            assert!(face.roughness.is_some(), "roughness should be populated");
+            assert!(face.albedo.is_some(), "albedo should be populated");
+            assert!(face.vegetation_density.is_some(), "vegetation_density should be populated");
+
+            let land = face.land_mask.as_ref().unwrap();
+            let biomes = face.biome_ids.as_ref().unwrap();
+            assert_eq!(land.len(), biomes.len());
+            // Masking invariant: ocean pixels are biome_id 0.
+            for i in 0..land.len() {
+                if land[i] == 0 {
+                    assert_eq!(biomes[i], 0);
+                }
+            }
+        }
     }
 }
