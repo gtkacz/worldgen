@@ -15,6 +15,8 @@ use worldgen::export::{
     PngExportOptions, RawFormat, PlateMapOptions,
     export_face_scalar_png_f32, export_face_mask_png_u8,
     export_planet_biome_map_png, BiomeMapOptions,
+    export_planet_exr, ExrExportOptions, ExrChannelsPreset,
+    export_planet_normal_maps_png, NormalMapOptions,
 };
 use worldgen::pipeline::{Pipeline, StageConfig, HeightmapStage, TectonicStage, ErosionStage, ClimateStage, BiomeStage};
 use worldgen::tectonics::TectonicConfig;
@@ -51,9 +53,21 @@ enum Commands {
         #[arg(short, long, default_value = "planet")]
         name: String,
 
+        /// Print per-stage and per-export timings.
+        #[arg(long)]
+        timings: bool,
+
         /// Export format.
         #[arg(short, long, default_value = "png")]
         format: ExportFormat,
+
+        /// Export normal maps (`{name}_normal_{face}.png`) generated from the final heights.
+        #[arg(long)]
+        normal_map: bool,
+
+        /// Normal strength (higher = stronger normals). Used with `--normal-map`.
+        #[arg(long, default_value = "2.0")]
+        normal_strength: f32,
 
         /// Number of noise octaves (4-10).
         #[arg(long, default_value = "6")]
@@ -194,6 +208,10 @@ enum Commands {
         /// Export vegetation density map (0..1).
         #[arg(long)]
         veg_map: bool,
+
+        /// For `--format exr`: which set of channels to write.
+        #[arg(long, default_value = "all-available", value_enum)]
+        exr_channels: ExrChannelsCli,
     },
 
     /// Display information about a planet configuration.
@@ -212,6 +230,28 @@ enum ExportFormat {
     Raw,
     /// 32-bit float RAW (high precision).
     RawFloat,
+    /// OpenEXR multi-channel float (VFX / DCC workflows).
+    Exr,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExrChannelsCli {
+    /// Only the `height` channel.
+    HeightOnly,
+    /// Write `height` plus any other channels currently available on the face.
+    AllAvailable,
+    /// Always write the full schema; fill missing channels with 0.0.
+    StableSchema,
+}
+
+impl From<ExrChannelsCli> for ExrChannelsPreset {
+    fn from(v: ExrChannelsCli) -> Self {
+        match v {
+            ExrChannelsCli::HeightOnly => ExrChannelsPreset::HeightOnly,
+            ExrChannelsCli::AllAvailable => ExrChannelsPreset::AllAvailable,
+            ExrChannelsCli::StableSchema => ExrChannelsPreset::StableSchema,
+        }
+    }
 }
 
 fn main() {
@@ -223,7 +263,10 @@ fn main() {
             seed,
             output,
             name,
+            timings,
             format,
+            normal_map,
+            normal_strength,
             octaves,
             frequency,
             lacunarity,
@@ -258,13 +301,17 @@ fn main() {
             roughness_map,
             albedo_map,
             veg_map,
+            exr_channels,
         } => {
             run_generate(
                 resolution,
                 seed,
                 output,
                 name,
+                timings,
                 format,
+                normal_map,
+                normal_strength,
                 octaves,
                 frequency,
                 lacunarity,
@@ -299,6 +346,7 @@ fn main() {
                 roughness_map,
                 albedo_map,
                 veg_map,
+                exr_channels,
             );
         }
         Commands::Info { resolution } => {
@@ -312,7 +360,10 @@ fn run_generate(
     seed: Option<u64>,
     output: PathBuf,
     name: String,
+    timings: bool,
     format: ExportFormat,
+    normal_map: bool,
+    normal_strength: f32,
     octaves: u8,
     frequency: f32,
     lacunarity: f32,
@@ -347,6 +398,7 @@ fn run_generate(
     roughness_map: bool,
     albedo_map: bool,
     veg_map: bool,
+    exr_channels: ExrChannelsCli,
 ) {
     // Validate parameters
     if resolution < 16 || resolution > 8192 {
@@ -472,20 +524,40 @@ fn run_generate(
         println!("Biome generation: SKIPPED");
     }
 
-    pipeline
-        .run_with_callbacks(
-            &mut planet,
-            |name, i, total| {
-                println!("  [{}/{}] Starting: {}", i + 1, total, name);
-            },
-            |name, i, total| {
-                println!("  [{}/{}] Completed: {}", i + 1, total, name);
-            },
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Error during generation: {}", e);
-            std::process::exit(1);
-        });
+    if timings {
+        pipeline
+            .run_with_callbacks_and_timings(
+                &mut planet,
+                |name, i, total| {
+                    println!("  [{}/{}] Starting: {}", i + 1, total, name);
+                },
+                |name, i, total| {
+                    println!("  [{}/{}] Completed: {}", i + 1, total, name);
+                },
+                |name, dt| {
+                    println!("           Time: {:.2?} ({})", dt, name);
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error during generation: {}", e);
+                std::process::exit(1);
+            });
+    } else {
+        pipeline
+            .run_with_callbacks(
+                &mut planet,
+                |name, i, total| {
+                    println!("  [{}/{}] Starting: {}", i + 1, total, name);
+                },
+                |name, i, total| {
+                    println!("  [{}/{}] Completed: {}", i + 1, total, name);
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error during generation: {}", e);
+                std::process::exit(1);
+            });
+    }
 
     let gen_time = start.elapsed();
     println!("Generation completed in {:.2?}", gen_time);
@@ -503,6 +575,7 @@ fn run_generate(
         std::process::exit(1);
     });
 
+    let base_export_t0 = Instant::now();
     match format {
         ExportFormat::Png => {
             let options = PngExportOptions {
@@ -532,10 +605,41 @@ fn run_generate(
                 });
             println!("  Exported 6 RAW files (R32 float): {}_*.raw", name);
         }
+        ExportFormat::Exr => {
+            let options = ExrExportOptions {
+                preset: exr_channels.into(),
+                ..Default::default()
+            };
+            export_planet_exr(&planet, &output, &name, &options).unwrap_or_else(|e| {
+                eprintln!("Error exporting EXR: {}", e);
+                std::process::exit(1);
+            });
+            println!("  Exported 6 EXR files: {}_*.exr", name);
+        }
+    }
+    if timings {
+        println!("  Base export time: {:.2?}", base_export_t0.elapsed());
+    }
+
+    if normal_map {
+        let t0 = Instant::now();
+        let options = NormalMapOptions {
+            strength: normal_strength,
+            ..Default::default()
+        };
+        export_planet_normal_maps_png(&planet, &output, &name, &options).unwrap_or_else(|e| {
+            eprintln!("Error exporting normal maps: {}", e);
+            std::process::exit(1);
+        });
+        println!("  Exported normal maps: {}_normal_*.png", name);
+        if timings {
+            println!("  Normal map export time: {:.2?}", t0.elapsed());
+        }
     }
 
     // Export plate maps if requested and tectonics was run
     if plate_map && !skip_tectonics {
+        let t0 = Instant::now();
         let plate_map_name = format!("{}_plates", name);
         let plate_options = PlateMapOptions::default();
         export_planet_plate_map(&planet, &output, &plate_map_name, &plate_options)
@@ -544,9 +648,13 @@ fn run_generate(
                 std::process::exit(1);
             });
         println!("  Exported 6 plate map files: {}_*.png", plate_map_name);
+        if timings {
+            println!("  Plate map export time: {:.2?}", t0.elapsed());
+        }
     }
 
     if boundary_map && !skip_tectonics {
+        let t0 = Instant::now();
         let boundary_map_name = format!("{}_boundaries", name);
         export_planet_boundary_map(&planet, &output, &boundary_map_name)
             .unwrap_or_else(|e| {
@@ -554,10 +662,14 @@ fn run_generate(
                 std::process::exit(1);
             });
         println!("  Exported 6 boundary map files: {}_*.png", boundary_map_name);
+        if timings {
+            println!("  Boundary map export time: {:.2?}", t0.elapsed());
+        }
     }
 
     // Export erosion-related maps if requested.
     if !skip_erosion && (water_map || sediment_map || flow_map || river_map || deposition_map) {
+        let t0_block = Instant::now();
         let res = planet.resolution();
 
         if water_map {
@@ -717,10 +829,14 @@ fn run_generate(
             }
             println!("  Exported deposition maps: {}_deposition_*.png", name);
         }
+        if timings {
+            println!("  Erosion debug maps export time: {:.2?}", t0_block.elapsed());
+        }
     }
 
     // Export climate monthly maps if requested (streamed month-by-month).
     if export_climate_monthly {
+        let t0 = Instant::now();
         let res = planet.resolution();
         let per_face = (res * res) as usize;
         let total = per_face * 6;
@@ -807,10 +923,14 @@ fn run_generate(
 
             println!("  Exported climate month {:02}: temp + precip", (month_idx + 1));
         }
+        if timings {
+            println!("  Monthly climate export time: {:.2?}", t0.elapsed());
+        }
     }
 
     // Export biome maps if requested.
     if !skip_biomes && (biome_map || land_mask || roughness_map || albedo_map || veg_map) {
+        let t0_block = Instant::now();
         let res = planet.resolution();
 
         if biome_map {
@@ -911,6 +1031,9 @@ fn run_generate(
                 }
             }
             println!("  Exported vegetation maps: {}_veg_*.png", name);
+        }
+        if timings {
+            println!("  Biome maps export time: {:.2?}", t0_block.elapsed());
         }
     }
 

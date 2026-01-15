@@ -2078,6 +2078,7 @@ dependencies = [
  "approx",
  "bytemuck",
  "clap",
+ "exr",
  "glam",
  "image",
  "pollster",

@@ -7,6 +7,8 @@ mod png;
 mod raw;
 mod plate_map;
 mod biome_map;
+mod exr;
+mod normal_map;
 
 pub use png::{
     export_face_png,
@@ -25,4 +27,12 @@ pub use plate_map::{
 pub use biome_map::{
     export_face_biome_map_png, export_planet_biome_map_png,
     BiomeMapOptions, BiomeMapError,
+};
+pub use exr::{
+    export_face_exr, export_planet_exr,
+    ExrExportOptions, ExrExportError, ExrChannelsPreset,
+};
+pub use normal_map::{
+    export_face_normal_map_png, export_planet_normal_maps_png,
+    NormalMapOptions, NormalMapError,
 };

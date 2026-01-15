@@ -1,6 +1,7 @@
 //! Generation stage trait and pipeline orchestration.
 
 use std::collections::HashMap;
+use std::time::Instant;
 use thiserror::Error;
 use rayon::prelude::*;
 use crate::terrain::Planet;
@@ -227,6 +228,49 @@ impl Pipeline {
             completed.push(stage.id());
 
             on_stage_complete(stage.name(), i, total);
+        }
+
+        Ok(())
+    }
+
+    /// Executes all stages with progress callbacks and per-stage timing.
+    ///
+    /// `on_stage_timing` is called after each stage completes successfully.
+    pub fn run_with_callbacks_and_timings<F1, F2, F3>(
+        &self,
+        planet: &mut Planet,
+        mut on_stage_start: F1,
+        mut on_stage_complete: F2,
+        mut on_stage_timing: F3,
+    ) -> Result<(), PipelineError>
+    where
+        F1: FnMut(&str, usize, usize),
+        F2: FnMut(&str, usize, usize),
+        F3: FnMut(&str, std::time::Duration),
+    {
+        let total = self.stages.len();
+        let mut completed: Vec<StageId> = Vec::new();
+
+        for (i, stage) in self.stages.iter().enumerate() {
+            on_stage_start(stage.name(), i, total);
+
+            // Check dependencies
+            for dep in stage.dependencies() {
+                if !completed.contains(dep) {
+                    return Err(PipelineError::MissingDependency(
+                        stage.name().to_string(),
+                        dep.name().to_string(),
+                    ));
+                }
+            }
+
+            let t0 = Instant::now();
+            stage.execute(planet, &self.config)?;
+            let dt = t0.elapsed();
+
+            completed.push(stage.id());
+            on_stage_complete(stage.name(), i, total);
+            on_stage_timing(stage.name(), dt);
         }
 
         Ok(())
