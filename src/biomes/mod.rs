@@ -30,6 +30,7 @@ pub enum BiomeId {
     TropicalSeasonalForest = 9,
     TropicalRainforest = 10,
     Mountain = 11,
+    Wetlands = 12,
 }
 
 impl BiomeId {
@@ -51,6 +52,7 @@ impl BiomeId {
             BiomeId::TropicalSeasonalForest => 0.13,
             BiomeId::TropicalRainforest => 0.12,
             BiomeId::Mountain => 0.22,
+            BiomeId::Wetlands => 0.16,
         }
     }
 
@@ -68,6 +70,7 @@ impl BiomeId {
             BiomeId::TropicalSeasonalForest => 0.75,
             BiomeId::TropicalRainforest => 0.95,
             BiomeId::Mountain => 0.25,
+            BiomeId::Wetlands => 0.80,
         }
     }
 
@@ -76,15 +79,16 @@ impl BiomeId {
         match self {
             BiomeId::IceCap => [240, 248, 255],
             BiomeId::Tundra => [170, 190, 170],
-            BiomeId::BorealForest => [30, 80, 40],
-            BiomeId::TemperateGrassland => [130, 180, 90],
-            BiomeId::TemperateDeciduousForest => [40, 120, 60],
-            BiomeId::TemperateRainforest => [20, 100, 60],
-            BiomeId::SubtropicalDesert => [220, 205, 140],
-            BiomeId::Savanna => [190, 190, 95],
-            BiomeId::TropicalSeasonalForest => [50, 150, 70],
-            BiomeId::TropicalRainforest => [20, 140, 55],
+            BiomeId::BorealForest => [25, 85, 45],
+            BiomeId::TemperateGrassland => [120, 185, 95],
+            BiomeId::TemperateDeciduousForest => [40, 130, 70],
+            BiomeId::TemperateRainforest => [15, 110, 75],
+            BiomeId::SubtropicalDesert => [228, 210, 145],
+            BiomeId::Savanna => [198, 192, 92],
+            BiomeId::TropicalSeasonalForest => [55, 165, 85],
+            BiomeId::TropicalRainforest => [18, 150, 70],
             BiomeId::Mountain => [140, 140, 140],
+            BiomeId::Wetlands => [55, 140, 120],
         }
     }
 }
@@ -115,6 +119,7 @@ pub fn biome_preview_rgb(biome_id: u8) -> [u8; 3] {
         9 => BiomeId::TropicalSeasonalForest.preview_rgb(),
         10 => BiomeId::TropicalRainforest.preview_rgb(),
         11 => BiomeId::Mountain.preview_rgb(),
+        12 => BiomeId::Wetlands.preview_rgb(),
         _ => [255, 0, 255],
     }
 }
@@ -127,11 +132,32 @@ fn classify_whittaker_like(
     temp_mean_c: f32,
     precip_annual_mm: f32,
     temp_min_month_c: f32,
+    roughness_01: f32,
+    river_dist_steps: u8,
     cfg: &BiomeConfig,
 ) -> BiomeId {
     // Mountains get a distinct biome at high elevation; also reduces vegetation later.
     if height_km >= cfg.sea_level + 3.0 {
         return BiomeId::Mountain;
+    }
+
+    // Wetlands: prefer explicit river adjacency when available; otherwise use a coastal/flat fallback.
+    // Keep this early so it can override forest/grassland in wet floodplains.
+    if temp_mean_c > 2.0 && temp_mean_c < 28.0 && temp_min_month_c > -8.0 {
+        // Hydrology-proxied trigger:
+        // widen floodplains around rivers when very wet, but avoid rugged areas.
+        let wet_enough = precip_annual_mm >= 1200.0;
+        let max_steps = if precip_annual_mm >= 2000.0 { 2 } else if precip_annual_mm >= 1400.0 { 1 } else { 0 };
+        let flat_enough = roughness_01 <= 0.35;
+        if wet_enough && flat_enough && river_dist_steps <= max_steps {
+            return BiomeId::Wetlands;
+        }
+        // Fallback: low relief, near sea level, very wet (coastal marsh / deltas)
+        let near_sea = height_km <= cfg.sea_level + 0.25;
+        let flat = roughness_01 <= 0.12;
+        if near_sea && flat && precip_annual_mm >= 1800.0 {
+            return BiomeId::Wetlands;
+        }
     }
 
     // Permanent ice: sustained cold.
@@ -208,6 +234,30 @@ fn global_index(res: u32, face: CubeFaceId, x: u32, y: u32) -> usize {
     face.index() * per_face + (y * res + x) as usize
 }
 
+fn for_each_neighbor8<F: FnMut(CubeFaceId, u32, u32)>(
+    res: u32,
+    face: CubeFaceId,
+    x: u32,
+    y: u32,
+    mut f: F,
+) {
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let (mut ff, mut px, mut py) = (face, x, y);
+            if dx != 0 {
+                (ff, px, py) = neighbor_4(res, ff, px, py, dx, 0);
+            }
+            if dy != 0 {
+                (ff, px, py) = neighbor_4(res, ff, px, py, 0, dy);
+            }
+            f(ff, px, py);
+        }
+    }
+}
+
 /// Compute biome outputs for a full cube-sphere planet grid.
 ///
 /// All inputs are flattened in face order, length `6*res*res`.
@@ -259,6 +309,74 @@ pub fn compute_biomes(
         }
     }
 
+    // River proximity (0..2 steps), if river mask is provided.
+    //
+    // Expansion is anisotropic: it prefers low-lying floodplains by limiting uphill steps.
+    // This keeps wetlands from climbing aggressively into mountainous terrain while still
+    // widening along valleys.
+    let (river0, near1, near2): (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) = if let Some(r) = river_mask {
+        // Maximum uphill (km) allowed per expansion step.
+        // (kept as a code constant per your preference)
+        const MAX_UPHILL_PER_STEP_KM: f32 = 0.04;
+
+        let mut r0 = vec![0u8; total];
+        for i in 0..total {
+            r0[i] = if r[i] >= 128 { 1 } else { 0 };
+        }
+
+        let mut n1 = vec![0u8; total];
+        for face in CubeFaceId::all() {
+            for y in 0..res {
+                for x in 0..res {
+                    let i = global_index(res, face, x, y);
+                    if r0[i] == 1 {
+                        n1[i] = 1;
+                        continue;
+                    }
+                    let mut any = false;
+                    for_each_neighbor8(res, face, x, y, |f2, x2, y2| {
+                        if any {
+                            return;
+                        }
+                        let j = global_index(res, f2, x2, y2);
+                        if r0[j] == 1 && heights_km[i] <= heights_km[j] + MAX_UPHILL_PER_STEP_KM {
+                            any = true;
+                        }
+                    });
+                    n1[i] = if any { 1 } else { 0 };
+                }
+            }
+        }
+
+        let mut n2 = vec![0u8; total];
+        for face in CubeFaceId::all() {
+            for y in 0..res {
+                for x in 0..res {
+                    let i = global_index(res, face, x, y);
+                    if n1[i] == 1 {
+                        n2[i] = 1;
+                        continue;
+                    }
+                    let mut any = false;
+                    for_each_neighbor8(res, face, x, y, |f2, x2, y2| {
+                        if any {
+                            return;
+                        }
+                        let j = global_index(res, f2, x2, y2);
+                        if n1[j] == 1 && heights_km[i] <= heights_km[j] + MAX_UPHILL_PER_STEP_KM {
+                            any = true;
+                        }
+                    });
+                    n2[i] = if any { 1 } else { 0 };
+                }
+            }
+        }
+
+        (Some(r0), Some(n1), Some(n2))
+    } else {
+        (None, None, None)
+    };
+
     // Second pass: biome classification + derived maps.
     for face in CubeFaceId::all() {
         for y in 0..res {
@@ -280,7 +398,14 @@ pub fn compute_biomes(
                 let p = (precip_annual_mm[i] + cfg.jitter_precip_mm * j).max(0.0);
                 let tmin = temp_min_month_c[i];
 
-                let biome = classify_whittaker_like(h, t, p, tmin, cfg);
+                let river_dist_steps: u8 = match (&river0, &near1, &near2) {
+                    (Some(r0), Some(n1), Some(n2)) => {
+                        if r0[i] == 1 { 0 } else if n1[i] == 1 { 1 } else if n2[i] == 1 { 2 } else { u8::MAX }
+                    }
+                    _ => u8::MAX,
+                };
+
+                let biome = classify_whittaker_like(h, t, p, tmin, roughness[i], river_dist_steps, cfg);
                 biome_ids[i] = biome.as_u8();
 
                 // Vegetation: combine biome base with climate signal.
@@ -295,10 +420,10 @@ pub fn compute_biomes(
                 }
 
                 // Optional river proximity boost.
-                if let Some(r) = river_mask {
-                    if r[i] >= 128 {
-                        veg = (veg + cfg.river_veg_boost).clamp(0.0, 1.0);
-                    }
+                if river_dist_steps <= 2 {
+                    // Strongest on-river, taper within 2 pixels.
+                    let w = 1.0 - (river_dist_steps as f32) / 3.0;
+                    veg = (veg + cfg.river_veg_boost * w).clamp(0.0, 1.0);
                 }
 
                 vegetation_density[i] = veg.clamp(0.0, 1.0);
@@ -375,6 +500,99 @@ mod tests {
         assert!(out.roughness.iter().all(|&v| v >= 0.0 && v <= 1.0));
         assert!(out.albedo.iter().all(|&v| v >= 0.0 && v <= 1.0));
         assert!(out.vegetation_density.iter().all(|&v| v >= 0.0 && v <= 1.0));
+    }
+
+    #[test]
+    fn wetlands_trigger_on_river_when_wet() {
+        let res = 8;
+        let total = (res * res) as usize * 6;
+        let cfg = BiomeConfig { sea_level: 0.0, seed: 0, ..Default::default() };
+
+        // Land everywhere.
+        let heights = vec![0.15f32; total];
+        // Temperate.
+        let t = vec![18.0f32; total];
+        // Wet.
+        let p = vec![2200.0f32; total];
+        let tmin = vec![5.0f32; total];
+
+        // Put a river pixel in the middle of face 0.
+        let mut river = vec![0u8; total];
+        let mid = (res / 2) as usize;
+        let idx = 0 * (res as usize * res as usize) + mid * (res as usize) + mid;
+        river[idx] = 255;
+
+        let out = compute_biomes(res, &cfg, &heights, &t, &p, &tmin, Some(&river));
+        assert_eq!(out.biome_ids[idx], BiomeId::Wetlands.as_u8());
+    }
+
+    #[test]
+    fn wetlands_expand_to_adjacent_pixels_when_very_wet() {
+        let res = 8;
+        let total = (res * res) as usize * 6;
+        let cfg = BiomeConfig { sea_level: 0.0, seed: 0, ..Default::default() };
+
+        // Land everywhere, temperate, very wet (enables radius 2).
+        let heights = vec![0.15f32; total];
+        let t = vec![18.0f32; total];
+        let p = vec![2600.0f32; total];
+        let tmin = vec![5.0f32; total];
+
+        // River pixel at (mid, mid) on face 0.
+        let mut river = vec![0u8; total];
+        let per_face = (res as usize) * (res as usize);
+        let mid = (res / 2) as usize;
+        let center = 0 * per_face + mid * (res as usize) + mid;
+        river[center] = 255;
+
+        // Adjacent pixel (mid+1, mid).
+        let adj = 0 * per_face + mid * (res as usize) + (mid + 1);
+
+        let out = compute_biomes(res, &cfg, &heights, &t, &p, &tmin, Some(&river));
+        assert_eq!(out.biome_ids[center], BiomeId::Wetlands.as_u8());
+        assert_eq!(out.biome_ids[adj], BiomeId::Wetlands.as_u8());
+    }
+
+    #[test]
+    fn wetlands_expansion_resists_uphill() {
+        let res = 8;
+        let total = (res * res) as usize * 6;
+        let cfg = BiomeConfig { sea_level: 0.0, seed: 0, ..Default::default() };
+
+        // Mostly flat land.
+        let mut heights = vec![0.15f32; total];
+        let t = vec![18.0f32; total];
+        let p = vec![2600.0f32; total]; // very wet => allows radius 2 (if reachable)
+        let tmin = vec![5.0f32; total];
+
+        let per_face = (res as usize) * (res as usize);
+        let mid = (res / 2) as usize;
+        let center = 0 * per_face + mid * (res as usize) + mid;
+
+        // Create a small height gradient around the river:
+        // - right neighbor is slightly downhill (should allow wetlands)
+        // - left neighbor is too uphill (should resist wetlands)
+        heights[center] = 0.20;
+        let right = 0 * per_face + mid * (res as usize) + (mid + 1);
+        let left = 0 * per_face + mid * (res as usize) + (mid - 1);
+        heights[right] = 0.19;
+        heights[left] = 0.26; // +0.06 km relative to river cell; should be blocked by uphill limit
+
+        let mut river = vec![0u8; total];
+        river[center] = 255;
+
+        let out = compute_biomes(res, &cfg, &heights, &t, &p, &tmin, Some(&river));
+        assert_eq!(out.biome_ids[center], BiomeId::Wetlands.as_u8());
+        assert_eq!(
+            out.biome_ids[right],
+            BiomeId::Wetlands.as_u8(),
+            "downhill neighbor should become wetlands"
+        );
+        assert_ne!(
+            out.biome_ids[left],
+            BiomeId::Wetlands.as_u8(),
+            "uphill neighbor should resist wetlands expansion"
+        );
     }
 }
 
