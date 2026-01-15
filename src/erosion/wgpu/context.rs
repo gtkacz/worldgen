@@ -36,7 +36,8 @@ impl ErosionGpuContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("worldgen-erosion-device"),
-                    required_features: wgpu::Features::empty(),
+                    // Needed for efficiently zero-initializing large textures at high resolutions.
+                    required_features: wgpu::Features::CLEAR_TEXTURE,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },

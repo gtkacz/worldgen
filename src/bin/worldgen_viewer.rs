@@ -103,30 +103,37 @@ fn pack_rgba8_rows_padded(width: u32, height: u32, rgba: &[u8]) -> (Vec<u8>, u32
     (out, padded_bpr)
 }
 
+fn pack_f32_rows_padded(width: u32, height: u32, pixels: &[f32]) -> (Vec<u8>, u32) {
+    let bytes_per_row = width * 4;
+    let padded_bpr = align_to(bytes_per_row, 256);
+    let padded_row_f32 = (padded_bpr / 4) as usize;
+    let w = width as usize;
+    let h = height as usize;
+    assert_eq!(pixels.len(), w * h);
+
+    let mut out_f32 = vec![0.0f32; padded_row_f32 * h];
+    for y in 0..h {
+        let src = y * w;
+        let dst = y * padded_row_f32;
+        out_f32[dst..dst + w].copy_from_slice(&pixels[src..src + w]);
+    }
+    (bytemuck::cast_slice(&out_f32).to_vec(), padded_bpr)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    center_lon: f32,
-    center_lat: f32,
-    zoom: f32,
-    mode: u32,       // 0=height, 1=biomes
-    has_biomes: u32, // 0/1
-    _pad0: [u32; 2],
-    aspect: f32,
-    _pad1: [f32; 3],
+    /// (center_lon, center_lat, zoom, aspect)
+    f0: [f32; 4],
+    /// (mode, has_biomes, _, _)
+    u0: [u32; 4],
 }
 
 impl Uniforms {
     fn new(aspect: f32, has_biomes: bool) -> Self {
         Self {
-            center_lon: 0.0,
-            center_lat: 0.0,
-            zoom: 1.0,
-            mode: 0,
-            has_biomes: if has_biomes { 1 } else { 0 },
-            _pad0: [0; 2],
-            aspect,
-            _pad1: [0.0; 3],
+            f0: [0.0, 0.0, 1.0, aspect],
+            u0: [0, if has_biomes { 1 } else { 0 }, 0, 0],
         }
     }
 }
@@ -282,10 +289,10 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Digit1) => state.uniforms.mode = 0,
+                        PhysicalKey::Code(KeyCode::Digit1) => state.uniforms.u0[0] = 0,
                         PhysicalKey::Code(KeyCode::Digit2) => {
-                            if state.uniforms.has_biomes != 0 {
-                                state.uniforms.mode = 1
+                            if state.uniforms.u0[1] != 0 {
+                                state.uniforms.u0[0] = 1
                             }
                         }
                         _ => {}
@@ -366,11 +373,26 @@ impl GpuState {
             .await
             .ok_or_else(|| other_err("No suitable GPU adapter found"))?;
 
+        // Preferred: use R16Unorm height textures (direct upload from 16-bit PNG faces).
+        // Fallback: use R32Float height textures and upload converted normalized floats.
+        let adapter_features = adapter.features();
+        let supports_r16_norm = adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let required_features = if supports_r16_norm {
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        } else {
+            wgpu::Features::empty()
+        };
+        let height_format = if supports_r16_norm {
+            wgpu::TextureFormat::R16Unorm
+        } else {
+            wgpu::TextureFormat::R32Float
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("worldgen-viewer-device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -404,13 +426,13 @@ impl GpuState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R16Unorm,
+            format: height_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let height_view = height_tex.create_view(&wgpu::TextureViewDescriptor {
             label: Some("height-view"),
-            format: Some(wgpu::TextureFormat::R16Unorm),
+            format: Some(height_format),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0,
@@ -422,7 +444,16 @@ impl GpuState {
 
         // Upload height layers with padding (for alignment).
         for (layer, pixels) in height_layers.iter().enumerate() {
-            let (bytes, padded_bpr) = pack_u16_rows_padded(face_w, face_h, pixels);
+            let (bytes, padded_bpr) = if height_format == wgpu::TextureFormat::R16Unorm {
+                pack_u16_rows_padded(face_w, face_h, pixels)
+            } else {
+                // Convert u16 UNORM -> f32 in [0,1] for R32Float fallback.
+                let mut f32px = vec![0.0f32; pixels.len()];
+                for (dst, &src) in f32px.iter_mut().zip(pixels.iter()) {
+                    *dst = (src as f32) / 65535.0;
+                }
+                pack_f32_rows_padded(face_w, face_h, &f32px)
+            };
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &height_tex,
@@ -642,7 +673,7 @@ impl GpuState {
         self.config.width = self.window_size.width.max(1);
         self.config.height = self.window_size.height.max(1);
         self.surface.configure(&self.device, &self.config);
-        self.uniforms.aspect = (self.config.width as f32) / (self.config.height as f32);
+        self.uniforms.f0[3] = (self.config.width as f32) / (self.config.height as f32);
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -653,16 +684,17 @@ impl GpuState {
     fn pan_pixels(&mut self, delta: Vec2) {
         let w = self.config.width.max(1) as f32;
         let h = self.config.height.max(1) as f32;
-        let aspect = self.uniforms.aspect;
-        let lon_delta = (delta.x / w) * (std::f32::consts::PI * aspect) / self.uniforms.zoom;
-        let lat_delta = (-delta.y / h) * (std::f32::consts::PI) / self.uniforms.zoom;
-        self.uniforms.center_lon += lon_delta;
-        self.uniforms.center_lat = (self.uniforms.center_lat + lat_delta)
+        let aspect = self.uniforms.f0[3];
+        let zoom = self.uniforms.f0[2];
+        let lon_delta = (delta.x / w) * (std::f32::consts::PI * aspect) / zoom;
+        let lat_delta = (-delta.y / h) * (std::f32::consts::PI) / zoom;
+        self.uniforms.f0[0] += lon_delta;
+        self.uniforms.f0[1] = (self.uniforms.f0[1] + lat_delta)
             .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
     }
 
     fn zoom(&mut self, scroll_y: f32, cursor: Option<Vec2>) {
-        let old_zoom = self.uniforms.zoom;
+        let old_zoom = self.uniforms.f0[2];
         let factor = 1.1_f32.powf(scroll_y);
         let new_zoom = (old_zoom * factor).clamp(0.25, 128.0);
 
@@ -671,15 +703,15 @@ impl GpuState {
             let w = self.config.width.max(1) as f32;
             let h = self.config.height.max(1) as f32;
             let uv = Vec2::new(c.x / w, c.y / h);
-            let aspect = self.uniforms.aspect;
-            let (lon0, lat0) = lon_lat_from_screen(uv, self.uniforms.center_lon, self.uniforms.center_lat, old_zoom, aspect);
-            let (lon1, lat1) = lon_lat_from_screen(uv, self.uniforms.center_lon, self.uniforms.center_lat, new_zoom, aspect);
-            self.uniforms.center_lon += lon0 - lon1;
-            self.uniforms.center_lat = (self.uniforms.center_lat + (lat0 - lat1))
+            let aspect = self.uniforms.f0[3];
+            let (lon0, lat0) = lon_lat_from_screen(uv, self.uniforms.f0[0], self.uniforms.f0[1], old_zoom, aspect);
+            let (lon1, lat1) = lon_lat_from_screen(uv, self.uniforms.f0[0], self.uniforms.f0[1], new_zoom, aspect);
+            self.uniforms.f0[0] += lon0 - lon1;
+            self.uniforms.f0[1] = (self.uniforms.f0[1] + (lat0 - lat1))
                 .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
         }
 
-        self.uniforms.zoom = new_zoom;
+        self.uniforms.f0[2] = new_zoom;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -715,14 +747,10 @@ impl GpuState {
 
 const VIEWER_WGSL: &str = r#"
 struct Uniforms {
-  center_lon: f32,
-  center_lat: f32,
-  zoom: f32,
-  mode: u32,
-  has_biomes: u32,
-  _pad0: vec2<u32>,
-  aspect: f32,
-  _pad1: vec3<f32>,
+  // (center_lon, center_lat, zoom, aspect)
+  f0: vec4<f32>,
+  // (mode, has_biomes, _, _)
+  u0: vec4<u32>,
 };
 
 @group(0) @binding(0) var height_tex: texture_2d_array<f32>;
@@ -825,19 +853,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   let pi = 3.141592653589793;
 
   // Map screen UV to lon/lat with correct proportions (full globe is 2:1).
-  let lon = wrap_lon(u.center_lon + (in.uv.x - 0.5) * (pi * u.aspect) / u.zoom);
-  let lat = clamp(u.center_lat + (0.5 - in.uv.y) * (pi) / u.zoom, -pi * 0.5, pi * 0.5);
+  let lon = wrap_lon(u.f0.x + (in.uv.x - 0.5) * (pi * u.f0.w) / u.f0.z);
+  let lat = clamp(u.f0.y + (0.5 - in.uv.y) * (pi) / u.f0.z, -pi * 0.5, pi * 0.5);
   let dir = lat_lon_to_dir(lat, lon);
   let fuv = sphere_to_face_uv(normalize(dir));
   let layer = u32(fuv.x + 0.5);
   let uv = vec2<f32>(fuv.y, fuv.z);
 
-  if (u.mode == 1u && u.has_biomes != 0u) {
-    let c = textureSampleLevel(biomes_tex, height_samp, vec3<f32>(uv, f32(layer)), 0.0);
+  if (u.u0.x == 1u && u.u0.y != 0u) {
+    let c = textureSampleLevel(biomes_tex, height_samp, uv, i32(layer), 0.0);
     return vec4<f32>(c.rgb, 1.0);
   }
 
-  let h = textureSampleLevel(height_tex, height_samp, vec3<f32>(uv, f32(layer)), 0.0).r;
+  let h = textureSampleLevel(height_tex, height_samp, uv, i32(layer), 0.0).r;
   return vec4<f32>(vec3<f32>(h), 1.0);
 }
 "#;

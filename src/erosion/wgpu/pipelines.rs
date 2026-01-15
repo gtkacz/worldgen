@@ -75,85 +75,24 @@ fn create_field(ctx: &ErosionGpuContext, label: &str, resolution: u32, format: w
     FieldTex { tex, view }
 }
 
-fn pack_f32_layers_padded(resolution: u32, values: &[f32]) -> (Vec<u8>, u32) {
+fn pack_f32_layer_padded(resolution: u32, values: &[f32]) -> (Vec<u8>, u32) {
     let per_face = (resolution * resolution) as usize;
-    assert_eq!(values.len(), per_face * 6);
+    assert_eq!(values.len(), per_face);
 
-    // wgpu requires bytes_per_row to be a multiple of 256 for buffer-texture copies.
+    // wgpu requires bytes_per_row to be a multiple of 256 for buffer-texture copies / writes.
     let bytes_per_row = resolution * 4;
     let padded_bpr = align_to(bytes_per_row, 256);
     let padded_row_floats = (padded_bpr / 4) as usize;
 
-    let mut out = vec![0f32; padded_row_floats * (resolution as usize) * 6];
-    for face in 0..6 {
-        for y in 0..resolution as usize {
-            let src_row_start = face * per_face + y * resolution as usize;
-            let dst_row_start = face * (padded_row_floats * resolution as usize) + y * padded_row_floats;
-            out[dst_row_start..dst_row_start + resolution as usize]
-                .copy_from_slice(&values[src_row_start..src_row_start + resolution as usize]);
-        }
+    let mut out = vec![0f32; padded_row_floats * (resolution as usize)];
+    for y in 0..resolution as usize {
+        let src_row_start = y * resolution as usize;
+        let dst_row_start = y * padded_row_floats;
+        out[dst_row_start..dst_row_start + resolution as usize]
+            .copy_from_slice(&values[src_row_start..src_row_start + resolution as usize]);
     }
 
     (bytemuck::cast_slice(&out).to_vec(), padded_bpr)
-}
-
-fn pack_vec4_layers_padded(resolution: u32, values: &[[f32; 4]]) -> (Vec<u8>, u32) {
-    let per_face = (resolution * resolution) as usize;
-    assert_eq!(values.len(), per_face * 6);
-
-    let bytes_per_row = resolution * 16;
-    let padded_bpr = align_to(bytes_per_row, 256);
-    let padded_row_vec4 = (padded_bpr / 16) as usize;
-
-    let mut out = vec![[0f32; 4]; padded_row_vec4 * (resolution as usize) * 6];
-    for face in 0..6 {
-        for y in 0..resolution as usize {
-            let src_row_start = face * per_face + y * resolution as usize;
-            let dst_row_start = face * (padded_row_vec4 * resolution as usize) + y * padded_row_vec4;
-            out[dst_row_start..dst_row_start + resolution as usize]
-                .copy_from_slice(&values[src_row_start..src_row_start + resolution as usize]);
-        }
-    }
-
-    (bytemuck::cast_slice(&out).to_vec(), padded_bpr)
-}
-
-fn unpack_f32_layers_padded(resolution: u32, padded_bpr: u32, bytes: &[u8]) -> Vec<f32> {
-    let bytes_per_row = padded_bpr as usize;
-    let rows_per_image = resolution as usize;
-    let layer_stride = bytes_per_row * rows_per_image;
-    assert!(bytes.len() >= layer_stride * 6);
-
-    let mut out = vec![0f32; (resolution as usize) * (resolution as usize) * 6];
-    for face in 0..6 {
-        for y in 0..rows_per_image {
-            let src = face * layer_stride + y * bytes_per_row;
-            let row_f32: &[f32] = bytemuck::cast_slice(&bytes[src..src + bytes_per_row]);
-            let dst_row_start = face * (resolution as usize) * (resolution as usize) + y * resolution as usize;
-            out[dst_row_start..dst_row_start + resolution as usize]
-                .copy_from_slice(&row_f32[..resolution as usize]);
-        }
-    }
-    out
-}
-
-fn unpack_vec4_layers_padded(resolution: u32, padded_bpr: u32, bytes: &[u8]) -> Vec<[f32; 4]> {
-    let bytes_per_row = padded_bpr as usize;
-    let rows_per_image = resolution as usize;
-    let layer_stride = bytes_per_row * rows_per_image;
-    assert!(bytes.len() >= layer_stride * 6);
-
-    let mut out = vec![[0f32; 4]; (resolution as usize) * (resolution as usize) * 6];
-    for face in 0..6 {
-        for y in 0..rows_per_image {
-            let src = face * layer_stride + y * bytes_per_row;
-            let row_v4: &[[f32; 4]] = bytemuck::cast_slice(&bytes[src..src + bytes_per_row]);
-            let dst_row_start = face * (resolution as usize) * (resolution as usize) + y * resolution as usize;
-            out[dst_row_start..dst_row_start + resolution as usize]
-                .copy_from_slice(&row_v4[..resolution as usize]);
-        }
-    }
-    out
 }
 
 pub struct ErosionGpu {
@@ -446,144 +385,78 @@ impl ErosionGpu {
         }
     }
 
-    fn upload_r32(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        tex: &wgpu::Texture,
-        resolution: u32,
-        values: &[f32],
-        label: &str,
-    ) {
-        let (bytes, padded_bpr) = pack_f32_layers_padded(resolution, values);
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("{label}-upload-buffer")),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.ctx.queue.write_buffer(&buf, 0, &bytes);
-
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
-                buffer: &buf,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(resolution),
-                },
-            },
-            wgpu::ImageCopyTexture {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: resolution,
-                height: resolution,
-                depth_or_array_layers: 6,
-            },
-        );
-    }
-
-    fn upload_rgba32(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        tex: &wgpu::Texture,
-        resolution: u32,
-        values: &[[f32; 4]],
-        label: &str,
-    ) {
-        let (bytes, padded_bpr) = pack_vec4_layers_padded(resolution, values);
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("{label}-upload-buffer")),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.ctx.queue.write_buffer(&buf, 0, &bytes);
-
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
-                buffer: &buf,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(resolution),
-                },
-            },
-            wgpu::ImageCopyTexture {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: resolution,
-                height: resolution,
-                depth_or_array_layers: 6,
-            },
-        );
-    }
-
-    fn readback_r32(&self, tex: &wgpu::Texture, resolution: u32, label: &str) -> Vec<f32> {
+    fn readback_r32_layers(&self, tex: &wgpu::Texture, resolution: u32, label: &str) -> Vec<f32> {
+        let per_face = (resolution * resolution) as usize;
+        let total = per_face * 6;
         let bytes_per_row = resolution * 4;
         let padded_bpr = align_to(bytes_per_row, 256);
         let layer_stride = (padded_bpr as u64) * (resolution as u64);
-        let size = layer_stride * 6;
 
-        let readback = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("{label}-readback-buffer")),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut out = vec![0f32; total];
 
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(&format!("{label}-readback-encoder")),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &readback,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(resolution),
+        for face in 0..6u32 {
+            let readback = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("{label}-readback-face{face}")),
+                size: layer_stride,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(&format!("{label}-readback-encoder-face{face}")),
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+                    aspect: wgpu::TextureAspect::All,
                 },
-            },
-            wgpu::Extent3d {
-                width: resolution,
-                height: resolution,
-                depth_or_array_layers: 6,
-            },
-        );
-        self.ctx.queue.submit(Some(encoder.finish()));
+                wgpu::ImageCopyBuffer {
+                    buffer: &readback,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(resolution),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.ctx.queue.submit(Some(encoder.finish()));
 
-        let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        // Block until the mapping is ready.
-        self.ctx.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().unwrap();
-        let data = slice.get_mapped_range();
-        let out = unpack_f32_layers_padded(resolution, padded_bpr, &data);
-        drop(data);
-        readback.unmap();
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+
+            let bytes_per_row_usize = padded_bpr as usize;
+            for y in 0..(resolution as usize) {
+                let src = y * bytes_per_row_usize;
+                let row_f32: &[f32] = bytemuck::cast_slice(&data[src..src + bytes_per_row_usize]);
+                let dst_row_start = (face as usize) * per_face + y * (resolution as usize);
+                out[dst_row_start..dst_row_start + resolution as usize]
+                    .copy_from_slice(&row_f32[..resolution as usize]);
+            }
+
+            drop(data);
+            readback.unmap();
+        }
+
         out
     }
 
     /// Run GPU hydraulic erosion on the planet and write the heightfield back.
     pub fn run_hydraulic(&self, planet: &mut Planet, config: &ErosionConfig) -> Result<ErosionGpuOutputs, ErosionGpuError> {
         let resolution = planet.resolution();
-        let total = (resolution as usize) * (resolution as usize) * 6;
+        let per_face = (resolution * resolution) as usize;
 
         // Textures (ping-pong): 0=input, 1=output
         let height = [
@@ -629,21 +502,52 @@ impl ErosionGpu {
         self.ctx.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
 
         // Upload initial data
-        let heights0 = Self::planet_to_layers(planet);
-        let zeros = vec![0.0f32; total];
-        let zeros_flux = vec![[0.0f32; 4]; total];
+        let heights0_for_deposition = if config.track_deposition {
+            Some(Self::planet_to_layers(planet))
+        } else {
+            None
+        };
 
+        // Upload per-face to avoid exceeding wgpu max buffer size.
+        for (layer, face) in planet.faces.iter().enumerate() {
+            let (bytes, padded_bpr) = pack_f32_layer_padded(resolution, &face.heights);
+            for tex in [&height[0].tex, &height[1].tex] {
+                self.ctx.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &bytes,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(resolution),
+                    },
+                    wgpu::Extent3d {
+                        width: resolution,
+                        height: resolution,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        // Clear non-height fields on GPU (avoids allocating huge zero staging buffers).
         let mut init = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("worldgen-erosion-init-encoder"),
         });
-        self.upload_r32(&mut init, &height[0].tex, resolution, &heights0, "height");
-        self.upload_r32(&mut init, &height[1].tex, resolution, &heights0, "height-copy");
-        self.upload_r32(&mut init, &water[0].tex, resolution, &zeros, "water");
-        self.upload_r32(&mut init, &water[1].tex, resolution, &zeros, "water-copy");
-        self.upload_r32(&mut init, &sediment[0].tex, resolution, &zeros, "sediment");
-        self.upload_r32(&mut init, &sediment[1].tex, resolution, &zeros, "sediment-copy");
-        self.upload_rgba32(&mut init, &flux[0].tex, resolution, &zeros_flux, "flux");
-        self.upload_rgba32(&mut init, &flux[1].tex, resolution, &zeros_flux, "flux-copy");
+        let range = wgpu::ImageSubresourceRange {
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(6),
+        };
+        for t in [&water[0].tex, &water[1].tex, &sediment[0].tex, &sediment[1].tex, &flux[0].tex, &flux[1].tex] {
+            init.clear_texture(t, &range);
+        }
         self.ctx.queue.submit(Some(init.finish()));
 
         // Bind groups for ping-pong directions.
@@ -709,13 +613,14 @@ impl ErosionGpu {
 
         // Read back from the current input textures (cur is the latest written-to side?).
         // After each pass we flip `cur`, so the most recent results live in `cur`.
-        let h = self.readback_r32(&height[cur].tex, resolution, "height");
-        let w = self.readback_r32(&water[cur].tex, resolution, "water");
-        let s = self.readback_r32(&sediment[cur].tex, resolution, "sediment");
+        let h = self.readback_r32_layers(&height[cur].tex, resolution, "height");
+        let w = self.readback_r32_layers(&water[cur].tex, resolution, "water");
+        let s = self.readback_r32_layers(&sediment[cur].tex, resolution, "sediment");
 
         Self::layers_to_planet(planet, &h);
         let deposition = if config.track_deposition {
-            h.iter().zip(heights0.iter()).map(|(&h1, &h0)| h1 - h0).collect()
+            let h0 = heights0_for_deposition.as_ref().expect("heights0 must exist when track_deposition is true");
+            h.iter().zip(h0.iter()).map(|(&h1, &h0)| h1 - h0).collect()
         } else {
             vec![0.0; h.len()]
         };
